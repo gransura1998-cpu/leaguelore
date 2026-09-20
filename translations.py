@@ -8,6 +8,4 @@ TRANSLATIONS = {
      },
     
 }
-
-LANGS = ["es_ES"]
 LANGS = list(TRANSLATIONS.keys())
