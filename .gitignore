@@ -3,9 +3,9 @@
 *.epub
 *.csv
 *.jpg
-!imgs/*.jpg
 *.json
 *.db
+*.zip
 meta.json
 # Byte-compiled / optimized / DLL files
 __pycache__/

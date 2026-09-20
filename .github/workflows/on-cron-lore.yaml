@@ -49,6 +49,10 @@ jobs:
           python kindle.py
           echo "NEW_CHAMP_COUNT=$(jq -r '.champ_count' meta.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Zip images
+        run: |
+          cd imgs && zip -r ../imgs.zip . && cd ..
+
       - name: Release
         # https://github.com/softprops/action-gh-release/tags
         uses: softprops/action-gh-release@v3
@@ -63,6 +67,7 @@ jobs:
           files: |
             *.epub
             lore.db
+            imgs.zip
 
       - name: Prune releases older than 3 months
         env:

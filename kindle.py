@@ -15,6 +15,27 @@ def get_safe_img_path(name):
     return "imgs/%s.jpg" % "".join([c for c in name if re.match(r"\w", c)])
 
 
+STORY_IMG_SRC = re.compile(r'<img[^>]*\bsrc="([^"]+)"')
+
+
+def register_img(book, img_path, added_imgs):
+    """Add a local image file as an epub resource, once per book."""
+    if img_path in added_imgs:
+        return
+    added_imgs.add(img_path)
+    img = Image.open(img_path).convert("RGB")
+    b = io.BytesIO()
+    img.save(b, "jpeg")
+    book.add_item(
+        epub.EpubItem(
+            uid=img_path,
+            file_name=img_path,
+            media_type="image/jpeg",
+            content=b.getvalue(),
+        )
+    )
+
+
 def story_title(story):
     if story["title"]:
         return story["title"]
@@ -38,6 +59,9 @@ def write_book(data, lang):
         uid="scripter",
     )
     data.sort(key=itemgetter("region"))
+
+    # Track which local image files have already been packaged into the epub
+    added_imgs = set()
 
     # Build the navigation in advance for reference
     i = 1
@@ -104,9 +128,11 @@ def write_book(data, lang):
             ]
             if len(d["stories"]) > 0:
                 content.append("<h2>%s</h2>" % TRANSLATIONS[lang]["story"])
-                for s in d["stories"]:
+                for s in sorted(d["stories"], key=itemgetter("url")):
                     content.append("<h3>%s</h3>" % story_title(s))
                     content.append("<p>%s</p>" % s["content"])
+                    for img_path in STORY_IMG_SRC.findall(s["content"] or ""):
+                        register_img(book, img_path, added_imgs)
             c.content = "".join(content)
 
             # add chapter

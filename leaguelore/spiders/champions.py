@@ -8,17 +8,25 @@ import sqlite3
 import time
 import os
 import os.path
+import io
 import math
 import re
 import shutil
 import tempfile
+import zipfile
+import copy
 from datetime import datetime, timezone
+from lxml.html import tostring
 
 from scrapy_playwright.page import PageMethod
 from scrapy.utils.project import data_path
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from urllib3.exceptions import InsecureRequestWarning
 
 from translations import LANGS
+
+# Corporate MITM proxy injects a self-signed cert; not a high-security project
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # "https://universe.leagueoflegends.com/%s/champions/"
 
 DEBUG = os.environ.get("DEBUG", "") != ""
@@ -29,6 +37,7 @@ CHAMP_LIST_SELECTOR = "li.item_30l8"
 # biography/type modules instead
 CHAMP_PAGE_SELECTOR = ".biographyText_3-to, .typeDescription_ixWu, h3.subheadline_rlsJ"
 STORY_SELECTOR = ".root_3nvd.dark_1RHo"
+CONTENT_SELECTOR = ".content_2ybc"
 NOT_FOUND_SELECTOR = "h3.code_Xnqs"
 HYDRATION_TIMEOUT = 8000
 PAGE_RELOADS = 3
@@ -63,17 +72,20 @@ def page_meta(selector, retry_count=0):
 DB_PATH = "lore.db"
 DB_REPO = os.environ.get("LORE_DB_REPO", "Fran-Rg/leaguelore")
 DB_ASSET_NAME = os.environ.get("LORE_DB_ASSET", DB_PATH)
+IMGS_ZIP_PATH = "imgs.zip"
+IMGS_ZIP_ASSET_NAME = os.environ.get("LORE_IMGS_ASSET", IMGS_ZIP_PATH)
 
 
-def _latest_db_asset():
+def _latest_release_asset(asset_name):
     resp = requests.get(
         "https://api.github.com/repos/%s/releases/latest" % DB_REPO,
         headers={"Accept": "application/vnd.github+json"},
         timeout=30,
+        verify=False,
     )
     resp.raise_for_status()
     for asset in resp.json().get("assets", []):
-        if asset.get("name") == DB_ASSET_NAME:
+        if asset.get("name") == asset_name:
             updated = datetime.strptime(
                 asset["updated_at"], "%Y-%m-%dT%H:%M:%SZ"
             ).replace(tzinfo=timezone.utc)
@@ -81,60 +93,89 @@ def _latest_db_asset():
     return None, None
 
 
-def fetch_db():
-    """Download lore.db from the latest GitHub release when missing or stale."""
-    local_mtime = os.path.getmtime(DB_PATH) if os.path.isfile(DB_PATH) else None
+def fetch_asset(path, asset_name):
+    """Download `asset_name` from the latest GitHub release into `path` when missing or stale."""
+    local_mtime = os.path.getmtime(path) if os.path.isfile(path) else None
     try:
-        url, remote_mtime = _latest_db_asset()
+        url, remote_mtime = _latest_release_asset(asset_name)
     except requests.RequestException as e:
         logging.warning("Could not check latest '%s' release: %s", DB_REPO, e)
         return
     if url is None:
-        logging.warning("No '%s' asset in latest '%s' release", DB_ASSET_NAME, DB_REPO)
+        logging.warning("No '%s' asset in latest '%s' release", asset_name, DB_REPO)
         return
     if local_mtime is not None and local_mtime >= remote_mtime:
-        logging.info("'%s' is up to date with latest release", DB_PATH)
+        logging.info("'%s' is up to date with latest release", path)
         return
 
-    logging.info("Downloading '%s' from %s", DB_PATH, url)
-    with requests.get(url, stream=True, timeout=120) as resp:
+    logging.info("Downloading '%s' from %s", path, url)
+    with requests.get(url, stream=True, timeout=120, verify=False) as resp:
         resp.raise_for_status()
         tmp_fd, tmp_path = tempfile.mkstemp(
-            dir=os.path.dirname(os.path.abspath(DB_PATH)), suffix=".part"
+            dir=os.path.dirname(os.path.abspath(path)) or ".", suffix=".part"
         )
         try:
             with os.fdopen(tmp_fd, "wb") as handler:
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
                     handler.write(chunk)
-            os.replace(tmp_path, DB_PATH)
+            os.replace(tmp_path, path)
         except BaseException:
             os.unlink(tmp_path)
             raise
     # Keep the release timestamp so later runs can compare against it
-    os.utime(DB_PATH, (remote_mtime, remote_mtime))
-    logging.info("Downloaded '%s' (%s bytes)", DB_PATH, os.path.getsize(DB_PATH))
+    os.utime(path, (remote_mtime, remote_mtime))
+    logging.info("Downloaded '%s' (%s bytes)", path, os.path.getsize(path))
 
 
-def download_champ_img(name, image_url):
-    safe_img_path = "imgs/%s.jpg" % "".join([c for c in name if re.match(r"\w", c)])
+def fetch_db():
+    """Download lore.db from the latest GitHub release when missing or stale."""
+    fetch_asset(DB_PATH, DB_ASSET_NAME)
+
+
+def fetch_imgs():
+    """Download imgs.zip from the latest GitHub release when missing or stale, and unpack it."""
+    fetch_asset(IMGS_ZIP_PATH, IMGS_ZIP_ASSET_NAME)
+    if os.path.isfile(IMGS_ZIP_PATH):
+        os.makedirs("imgs", exist_ok=True)
+        with zipfile.ZipFile(IMGS_ZIP_PATH) as zf:
+            zf.extractall("imgs")
+        logging.info("Unpacked '%s' into 'imgs/'", IMGS_ZIP_PATH)
+
+
+def download_img(image_url, name=None):
+    """Download an image and convert it to JPEG, keyed by `name` or the url's filename."""
+    if name is not None:
+        # kindle.py looks images up as imgs/<safe champion name>.jpg
+        safe_name = "".join([c for c in name if re.match(r"\w", c)])
+    else:
+        raw_name = image_url.split("?")[0].rsplit("/", 1)[-1]
+        safe_name = os.path.splitext(raw_name)[0]
+    safe_img_path = "imgs/%s.jpg" % safe_name
     if not os.path.isfile(safe_img_path):
-        img_data = requests.get(image_url).content
-        with open(safe_img_path, "wb") as handler:
-            handler.write(img_data)
+        img_data = requests.get(image_url, verify=False).content
+        im = Image.open(io.BytesIO(img_data))
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            # Flatten transparency onto white; JPEG has no alpha channel
+            background = Image.new("RGB", im.size, (255, 255, 255))
+            background.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[-1])
+            im = background
+        else:
+            im = im.convert("RGB")
+        im.save(safe_img_path, "JPEG", optimize=True, quality=95)
         im_stats = os.stat(safe_img_path)
         x2, y2 = None, None
-        while im_stats.st_size > 1024 * 50:  # bigger than 10kb
+        while im_stats.st_size > 1024 * 100:
             im = Image.open(safe_img_path)
-            # im = im.convert("L")  # Black & White
             x, y = im.size
             x2, y2 = math.floor(x * 0.9), math.floor(y * 0.9)
             im = im.resize((x2, y2), Image.Resampling.LANCZOS)
             im.save(safe_img_path, optimize=True, quality=95)
             im_stats = os.stat(safe_img_path)
             logging.debug(
-                "Reduced '%s' to '%s x %s' : size %s", name, x2, y2, im_stats.st_size
+                "Reduced '%s' to '%s x %s' : size %s", safe_name, x2, y2, im_stats.st_size
             )
-        logging.info("Img '%s' at '%s x %s' : size %s", name, x2, y2, im_stats.st_size)
+        logging.info("Img '%s' at '%s x %s' : size %s", safe_name, x2, y2, im_stats.st_size)
+    return safe_img_path
 
 
 async def wait_page(response):
@@ -142,6 +183,30 @@ async def wait_page(response):
     await page.wait_for_load_state()
     await page.wait_for_timeout(1000)
     await page.close()
+
+
+def extract_story(response):
+    """Story bodies span several sibling sections, so take the whole wrapper."""
+    nodes = response.css(CONTENT_SELECTOR)
+    # The selector also matches empty/hidden placeholder blocks, so use the
+    # first node that actually holds paragraph content
+    node = next((n for n in nodes if n.xpath(".//p")), None)
+    if node is None:
+        return None
+    root = copy.deepcopy(node.root)
+    for el in root.xpath('.//div[contains(@class, "noHeader_yvby")] | .//a'):
+        el.getparent().remove(el)
+    for el in root.xpath(".//img"):
+        image_url = el.attrib.get("src")
+        if image_url:
+            el.attrib["src"] = download_img(image_url)
+    # Drop styling/scripting hooks; only structure/text is kept
+    for el in root.iter():
+        el.attrib.pop("class", None)
+        el.attrib.pop("id", None)
+    if not root.xpath(".//p"):
+        return None
+    return tostring(root, encoding="unicode")
 
 
 class LeagueloreCharacterSpider(scrapy.Spider):
@@ -205,6 +270,7 @@ class LeagueloreCharacterSpider(scrapy.Spider):
 
     def build_db(self):
         fetch_db()
+        fetch_imgs()
         self.con = sqlite3.connect(DB_PATH)
         self.con.row_factory = sqlite3.Row
 
@@ -244,7 +310,7 @@ class LeagueloreCharacterSpider(scrapy.Spider):
         self.build_db()
         time.sleep(1)
         for lang in LANGS:
-            if DEBUG and lang != "pl_PL":
+            if DEBUG and lang != "en_US":
                 continue  # DEBUG
             yield scrapy.Request(
                 "https://yz.lol.qq.com/zh_CN/champions/"
@@ -269,7 +335,13 @@ class LeagueloreCharacterSpider(scrapy.Spider):
             for champion in champ_blocks:
                 champ_url = champion.css("a")[0].attrib["href"]
                 champ_code = champ_url.split("/")[-2]
-
+                if DEBUG and champ_code != "twistedfate":
+                    logging.debug(
+                        "[%s]Skipping champion '%s' due to DEBUG mode",
+                        kwargs["lang"],
+                        champ_code,
+                    )
+                    continue  # DEBUG
                 cb_kwargs = {"champion": champ_code} | kwargs
                 champ_page = response.urljoin(champ_url)
                 yield scrapy.Request(
@@ -437,7 +509,7 @@ class LeagueloreCharacterSpider(scrapy.Spider):
         image_url = response.css("div.image_3oOd.backgroundImage_5wQJ")[0].attrib[
             "data-am-url"
         ]
-        download_champ_img(kwargs["champion"], image_url)
+        download_img(image_url, kwargs["champion"])
 
         champ_parse = {"bio": bio} | kwargs
         self.save_champ(champ_parse)
@@ -470,7 +542,7 @@ class LeagueloreCharacterSpider(scrapy.Spider):
 
     def parse_story(self, response, **kwargs):
         retry_count = kwargs.pop("retry_count", 0)
-        content = response.css(".root_3nvd.dark_1RHo").get()
+        content = extract_story(response)
         if content is None:
             if retry_count >= MAX_RETRY_COUNT:
                 logging.error(
@@ -509,6 +581,24 @@ class LeagueloreCharacterSpider(scrapy.Spider):
         }
         self.save_story(story)
         yield story
+
+        next_url = response.xpath(
+            '//span[@data-gettext-identifier="story-next-prompt-cta"]/ancestor::a[1]/@href'
+        ).get()
+        if next_url is not None:
+            next_page = response.urljoin(next_url)
+            if self.get_story(next_page) is not None:
+                logging.debug(
+                    "[%s]Next chapter already in database: %s", kwargs["lang"], next_page
+                )
+            else:
+                yield scrapy.Request(
+                    next_page,
+                    callback=self.parse_story,
+                    errback=self.retry_on_failure,
+                    cb_kwargs={"champion": kwargs["champion"], "lang": kwargs["lang"]},
+                    meta=page_meta(STORY_SELECTOR),
+                )
 
     def save_champ(self, c):
         logging.info("[%s]Saving %s to DB", c["lang"], c["champion"])
