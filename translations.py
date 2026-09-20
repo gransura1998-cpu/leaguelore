@@ -9,5 +9,5 @@ TRANSLATIONS = {
     
 }
 
-# LANGS = ["en_US"]
+LANGS = ["es_ES"]
 LANGS = list(TRANSLATIONS.keys())
